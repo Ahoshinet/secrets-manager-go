@@ -49,4 +49,4 @@ err = client.SetSecret(ctx, "cdn", "DATABASE_URL", secrets.Secret("postgres://ne
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+BSD 2-Clause. See [LICENSE](LICENSE).
