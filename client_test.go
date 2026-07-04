@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,40 @@ func TestNewRejectsHTTP(t *testing.T) {
 	_, err := New(Config{ServerURL: "http://example.test", Token: "tok"})
 	if !errors.Is(err, ErrInsecureURL) {
 		t.Fatalf("expected ErrInsecureURL, got %v", err)
+	}
+}
+
+func TestNewAllowsLoopbackHTTP(t *testing.T) {
+	for _, u := range []string{
+		"http://127.0.0.1:18787",
+		"http://localhost:18787",
+		"http://[::1]:18787",
+	} {
+		if _, err := New(Config{ServerURL: u, Token: "tok"}); err != nil {
+			t.Fatalf("loopback URL %q should be accepted, got %v", u, err)
+		}
+	}
+	for _, u := range []string{
+		"http://192.168.1.10",
+		"http://localhost.evil.test",
+		"ftp://127.0.0.1",
+	} {
+		if _, err := New(Config{ServerURL: u, Token: "tok"}); !errors.Is(err, ErrInsecureURL) {
+			t.Fatalf("URL %q should be rejected with ErrInsecureURL, got %v", u, err)
+		}
+	}
+}
+
+func TestNewRejectsURLWithExtraParts(t *testing.T) {
+	for _, u := range []string{
+		"https://example.test/?q=1",
+		"https://example.test/#frag",
+		"https://user@example.test",
+		"https://user:pw@example.test",
+	} {
+		if _, err := New(Config{ServerURL: u, Token: "tok"}); !errors.Is(err, ErrInvalidURL) {
+			t.Fatalf("URL %q should be rejected with ErrInvalidURL, got %v", u, err)
+		}
 	}
 }
 
@@ -92,6 +127,70 @@ func TestStatusErrorsAreTyped(t *testing.T) {
 	_, err = client.GetSecrets(context.Background(), "cdn")
 	if !errors.Is(err, ErrForbidden) {
 		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+}
+
+func newTestServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *Client) {
+	t.Helper()
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	client, err := New(Config{ServerURL: server.URL, Token: "tok", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	return server, client
+}
+
+func TestWrongSuccessStatusIsRejected(t *testing.T) {
+	// GET answered with 201 violates the documented contract.
+	_, client := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"KEY":"v"}`)
+	})
+	if _, err := client.GetSecrets(context.Background(), "cdn"); !errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("expected ErrUnexpectedResponse, got %v", err)
+	}
+}
+
+func TestTrailingJSONIsRejected(t *testing.T) {
+	_, client := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"KEY":"v"}{"EXTRA":"doc"}`)
+	})
+	if _, err := client.GetSecrets(context.Background(), "cdn"); !errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("expected ErrUnexpectedResponse, got %v", err)
+	}
+}
+
+func TestOversizedResponseIsRejected(t *testing.T) {
+	_, client := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"KEY":"%s"}`, string(make([]byte, maxResponseBody+10)))
+	})
+	if _, err := client.GetSecrets(context.Background(), "cdn"); !errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("expected ErrUnexpectedResponse, got %v", err)
+	}
+}
+
+func TestHostileSecretKeyIsRejected(t *testing.T) {
+	_, client := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "{\"BAD\\nX=Y\":\"injected\"}")
+	})
+	if _, err := client.GetSecrets(context.Background(), "cdn"); !errors.Is(err, ErrUnexpectedResponse) {
+		t.Fatalf("expected ErrUnexpectedResponse, got %v", err)
+	}
+}
+
+func TestSecretRedactsAllFormatVerbs(t *testing.T) {
+	secret := Secret("super-sensitive")
+	for _, format := range []string{"%v", "%s", "%q", "%x", "%d", "%#v", "%+v"} {
+		got := fmt.Sprintf(format, secret)
+		if got != "[secret]" {
+			t.Fatalf("verb %s leaked: %q", format, got)
+		}
+	}
+	if got := fmt.Sprintf("%#v", struct{ S Secret }{secret}); got != "" && got != "struct { S secrets.Secret }{S:[secret]}" {
+		if !strings.Contains(got, "[secret]") || strings.Contains(got, "super-sensitive") {
+			t.Fatalf("nested %%#v leaked: %q", got)
+		}
 	}
 }
 

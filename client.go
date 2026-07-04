@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,7 +23,8 @@ import (
 const maxResponseBody = 1 << 20
 
 var (
-	ErrInsecureURL        = errors.New("secrets: server URL must use https")
+	ErrInsecureURL        = errors.New("secrets: server URL must use https (plain http is allowed only for loopback hosts)")
+	ErrInvalidURL         = errors.New("secrets: server URL must not contain userinfo, query, or fragment")
 	ErrMissingServerURL   = errors.New("secrets: missing server URL")
 	ErrMissingToken       = errors.New("secrets: missing token")
 	ErrUnexpectedResponse = errors.New("secrets: unexpected response")
@@ -72,8 +74,20 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secrets: invalid server URL: %w", err)
 	}
-	if parsed.Scheme != "https" {
+	switch parsed.Scheme {
+	case "https":
+	case "http":
+		// Same-host deployments (TLS terminated by a reverse proxy, server
+		// on loopback) may use plain http to loopback addresses only.
+		if !isLoopbackHost(parsed.Hostname()) {
+			return nil, ErrInsecureURL
+		}
+	default:
 		return nil, ErrInsecureURL
+	}
+	// A malformed base URL must not be able to smuggle extra request parts.
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, ErrInvalidURL
 	}
 
 	httpClient := cfg.HTTPClient
@@ -90,8 +104,19 @@ func New(cfg Config) (*Client, error) {
 
 func (c *Client) GetSecrets(ctx context.Context, project string) (map[string]Secret, error) {
 	var out map[string]Secret
-	if err := c.doJSON(ctx, http.MethodGet, c.projectPath(project, "secrets"), nil, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.projectPath(project, "secrets"), nil, &out, http.StatusOK); err != nil {
 		return nil, err
+	}
+	// Never trust server-returned keys: enforce the same rules the server
+	// applies on write, so a hostile server cannot hand callers keys like
+	// "BAD\nX=Y" destined for env vars or dotenv files.
+	for key := range out {
+		if !validSecretKey(key) {
+			for _, v := range out {
+				v.Zeroize()
+			}
+			return nil, fmt.Errorf("%w: invalid secret key in response", ErrUnexpectedResponse)
+		}
 	}
 	return out, nil
 }
@@ -103,21 +128,51 @@ func (c *Client) SetSecret(ctx context.Context, project, key string, value Secre
 	if err != nil {
 		return err
 	}
-	return c.doJSON(ctx, http.MethodPut, c.projectPath(project, "secrets", key), body, nil)
+	defer func() {
+		for i := range body {
+			body[i] = 0
+		}
+	}()
+	return c.doJSON(ctx, http.MethodPut, c.projectPath(project, "secrets", key), body, nil, http.StatusOK)
 }
 
 func (c *Client) DeleteSecret(ctx context.Context, project, key string) error {
-	return c.doJSON(ctx, http.MethodDelete, c.projectPath(project, "secrets", key), nil, nil)
+	return c.doJSON(ctx, http.MethodDelete, c.projectPath(project, "secrets", key), nil, nil, http.StatusNoContent)
 }
 
 func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
 	var out struct {
 		Projects []Project `json:"projects"`
 	}
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/projects", nil, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, "/v1/projects", nil, &out, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return out.Projects, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// validSecretKey mirrors the server-side key rules.
+func validSecretKey(key string) bool {
+	if len(key) == 0 || len(key) > 128 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_', c == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) projectPath(project string, parts ...string) string {
@@ -128,7 +183,7 @@ func (c *Client) projectPath(project string, parts ...string) string {
 	return path
 }
 
-func (c *Client) doJSON(ctx context.Context, method, path string, body []byte, out any) error {
+func (c *Client) doJSON(ctx context.Context, method, path string, body []byte, out any, wantStatus int) error {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -153,15 +208,38 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body []byte, o
 		io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
 		return err
 	}
+	// Enforce the exact status this operation documents (e.g. a DELETE
+	// answered with 200 instead of 204 is a contract violation).
+	if resp.StatusCode != wantStatus {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+		return fmt.Errorf("%w: status %d (expected %d)", ErrUnexpectedResponse, resp.StatusCode, wantStatus)
+	}
 	if out == nil {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
 		return nil
 	}
 
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody))
+	// Bounded read: reject bodies over the cap instead of silently
+	// truncating them, then require exactly one JSON document.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnexpectedResponse, err)
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	if len(raw) > maxResponseBody {
+		return fmt.Errorf("%w: response body exceeds %d bytes", ErrUnexpectedResponse, maxResponseBody)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("%w: %v", ErrUnexpectedResponse, err)
+	}
+	if dec.More() {
+		return fmt.Errorf("%w: trailing data after JSON document", ErrUnexpectedResponse)
 	}
 	return nil
 }
@@ -189,6 +267,17 @@ func (s Secret) Bytes() []byte {
 
 func (s Secret) String() string {
 	return "[secret]"
+}
+
+// GoString redacts `%#v` output, which would otherwise print the raw
+// byte contents via Go-syntax formatting.
+func (s Secret) GoString() string {
+	return "[secret]"
+}
+
+// Format redacts every fmt verb (%v, %s, %q, %x, %d, %#v, ...).
+func (s Secret) Format(f fmt.State, _ rune) {
+	io.WriteString(f, "[secret]")
 }
 
 func (s *Secret) Zeroize() {
