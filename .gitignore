@@ -1,0 +1,4 @@
+# Test / build artifacts
+*.test
+*.out
+/coverage.*
