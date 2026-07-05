@@ -5,7 +5,7 @@ HTTP API. In-process — fetch secrets directly in your Go program instead of
 shelling out to the `secrets` CLI.
 
 The wire contract this client targets is documented in the server repository at
-[`docs/API.md`](https://github.com/Ahoshinet/secrets-manager/blob/main/docs/API.md).
+[`docs/API.md`](https://github.com/Ahoshinet/secrets-manager/blob/master/docs/API.md).
 
 ## Install
 
