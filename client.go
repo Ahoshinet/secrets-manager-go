@@ -366,6 +366,13 @@ func unquoteJSONBytes(data []byte) ([]byte, error) {
 			}
 			continue
 		}
+		if c == '"' {
+			// An unescaped quote can only be the string terminator; since the
+			// closing quote is data[len-1], any '"' reached here is an interior
+			// unescaped quote, i.e. malformed JSON (e.g. `"a"b"`). Reject it so
+			// this parser is never more lenient than encoding/json.
+			return nil, errors.New("secrets: unescaped quote in JSON string")
+		}
 		if c < 0x20 {
 			return nil, errors.New("secrets: invalid JSON string control character")
 		}
