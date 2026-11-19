@@ -13,7 +13,7 @@ The wire contract this client targets is documented in the server repository at
 go get github.com/Ahoshinet/secrets-manager-go@latest
 ```
 
-Requires Go 1.27.3 or later.
+Requires Go 1.27.4 or later.
 
 ```go
 import secrets "github.com/Ahoshinet/secrets-manager-go"
